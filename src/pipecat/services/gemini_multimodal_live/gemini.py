@@ -30,6 +30,7 @@ from pipecat.frames.frames import (
     EndFrame,
     ErrorFrame,
     Frame,
+    FunctionCallResultFrame,
     InputAudioRawFrame,
     InputImageRawFrame,
     InputTextRawFrame,
@@ -768,6 +769,9 @@ class GeminiMultimodalLiveLLMService(LLMService):
             await self._update_settings(frame.settings)
         elif isinstance(frame, LLMSetToolsFrame):
             await self._update_settings()
+        elif isinstance(frame, FunctionCallResultFrame):
+            await self.handle_function_call_result(frame)
+            await self.push_frame(frame, direction)
         else:
             await self.push_frame(frame, direction)
 
@@ -1412,3 +1416,28 @@ class GeminiMultimodalLiveLLMService(LLMService):
         assistant_params.expect_stripped_words = False
         assistant = GeminiMultimodalLiveAssistantContextAggregator(context, params=assistant_params)
         return GeminiMultimodalLiveContextAggregatorPair(_user=user, _assistant=assistant)
+
+    async def handle_function_call_result(self, frame):
+        """Handle function call result frame.
+        
+        This method adds the function result to the context with the proper
+        tool_call_name field that Gemini Live API requires, then sends it
+        to the Gemini API.
+        
+        Args:
+            frame: The FunctionCallResultFrame containing the function result.
+        """
+        # Add the function result to the context with the tool_call_name field
+        # This is the fix for the missing function name issue in GitHub #908
+        message = {
+            "role": "tool",
+            "name": frame.function_name,
+            "tool_call_name": frame.function_name,  # Required by Gemini Live API
+            "content": json.dumps(frame.result) if frame.result else "COMPLETED",
+            "tool_call_id": frame.tool_call_id,
+        }
+        
+        self._context.add_message(message)
+        
+        # Send the tool result to Gemini API
+        await self._tool_result(message)
