@@ -20,9 +20,9 @@ from pipecat.frames.frames import (
     EndFrame,
     ErrorFrame,
     Frame,
+    InterruptionFrame,
     LLMFullResponseEndFrame,
     StartFrame,
-    StartInterruptionFrame,
     TTSAudioRawFrame,
     TTSStartedFrame,
     TTSStoppedFrame,
@@ -455,7 +455,7 @@ class SarvamTTSService(InterruptibleTTSService):
             direction: The direction to push the frame.
         """
         await super().push_frame(frame, direction)
-        if isinstance(frame, (TTSStoppedFrame, StartInterruptionFrame)):
+        if isinstance(frame, (TTSStoppedFrame, InterruptionFrame)):
             self._started = False
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
@@ -525,6 +525,7 @@ class SarvamTTSService(InterruptibleTTSService):
             logger.debug("Connected to Sarvam TTS Websocket")
             await self._send_config()
 
+            await self._call_event_handler("on_connected")
         except Exception as e:
             logger.error(f"{self} initialization error: {e}")
             self._websocket = None
@@ -556,6 +557,10 @@ class SarvamTTSService(InterruptibleTTSService):
                 await self._websocket.close()
         except Exception as e:
             logger.error(f"{self} error closing websocket: {e}")
+        finally:
+            self._started = False
+            self._websocket = None
+            await self._call_event_handler("on_disconnected")
 
     def _get_websocket(self):
         if self._websocket:

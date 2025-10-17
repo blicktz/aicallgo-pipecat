@@ -20,8 +20,8 @@ from pipecat.frames.frames import (
     EndFrame,
     ErrorFrame,
     Frame,
+    InterruptionFrame,
     StartFrame,
-    StartInterruptionFrame,
     TTSAudioRawFrame,
     TTSStartedFrame,
     TTSStoppedFrame,
@@ -344,10 +344,11 @@ class CartesiaTTSService(AudioContextWordTTSService):
         try:
             if self._websocket and self._websocket.state is State.OPEN:
                 return
-            logger.debug("Connecting to Cartesia")
+            logger.debug("Connecting to Cartesia TTS")
             self._websocket = await websocket_connect(
                 f"{self._url}?api_key={self._api_key}&cartesia_version={self._cartesia_version}"
             )
+            await self._call_event_handler("on_connected")
         except Exception as e:
             logger.error(f"{self} initialization error: {e}")
             self._websocket = None
@@ -365,13 +366,14 @@ class CartesiaTTSService(AudioContextWordTTSService):
         finally:
             self._context_id = None
             self._websocket = None
+            await self._call_event_handler("on_disconnected")
 
     def _get_websocket(self):
         if self._websocket:
             return self._websocket
         raise Exception("Websocket not connected")
 
-    async def _handle_interruption(self, frame: StartInterruptionFrame, direction: FrameDirection):
+    async def _handle_interruption(self, frame: InterruptionFrame, direction: FrameDirection):
         await super()._handle_interruption(frame, direction)
         await self.stop_all_metrics()
         if self._context_id:

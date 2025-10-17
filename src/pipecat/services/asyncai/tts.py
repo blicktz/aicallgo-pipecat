@@ -20,8 +20,8 @@ from pipecat.frames.frames import (
     EndFrame,
     ErrorFrame,
     Frame,
+    InterruptionFrame,
     StartFrame,
-    StartInterruptionFrame,
     TTSAudioRawFrame,
     TTSStartedFrame,
     TTSStoppedFrame,
@@ -52,6 +52,10 @@ def language_to_async_language(language: Language) -> Optional[str]:
     """
     BASE_LANGUAGES = {
         Language.EN: "en",
+        Language.FR: "fr",
+        Language.ES: "es",
+        Language.DE: "de",
+        Language.IT: "it",
     }
 
     result = BASE_LANGUAGES.get(language)
@@ -115,7 +119,6 @@ class AsyncAITTSService(InterruptibleTTSService):
         """
         super().__init__(
             aggregate_sentences=aggregate_sentences,
-            push_text_frames=False,
             pause_frame_processing=True,
             push_stop_frames=True,
             sample_rate=sample_rate,
@@ -232,6 +235,8 @@ class AsyncAITTSService(InterruptibleTTSService):
             }
 
             await self._get_websocket().send(json.dumps(init_msg))
+
+            await self._call_event_handler("on_connected")
         except Exception as e:
             logger.error(f"{self} initialization error: {e}")
             self._websocket = None
@@ -249,6 +254,7 @@ class AsyncAITTSService(InterruptibleTTSService):
         finally:
             self._websocket = None
             self._started = False
+            await self._call_event_handler("on_disconnected")
 
     def _get_websocket(self):
         if self._websocket:
@@ -271,7 +277,7 @@ class AsyncAITTSService(InterruptibleTTSService):
             direction: The direction to push the frame.
         """
         await super().push_frame(frame, direction)
-        if isinstance(frame, (TTSStoppedFrame, StartInterruptionFrame)):
+        if isinstance(frame, (TTSStoppedFrame, InterruptionFrame)):
             self._started = False
 
     async def _receive_messages(self):

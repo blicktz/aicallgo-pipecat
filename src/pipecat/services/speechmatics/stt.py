@@ -19,7 +19,6 @@ from loguru import logger
 from pydantic import BaseModel
 
 from pipecat.frames.frames import (
-    BotInterruptionFrame,
     CancelFrame,
     EndFrame,
     ErrorFrame,
@@ -578,6 +577,7 @@ class SpeechmaticsSTTService(STTService):
                 ),
             )
             logger.debug(f"{self} Connected to Speechmatics STT service")
+            await self._call_event_handler("on_connected")
         except Exception as e:
             logger.error(f"{self} Error connecting to Speechmatics: {e}")
             self._client = None
@@ -596,6 +596,7 @@ class SpeechmaticsSTTService(STTService):
             logger.error(f"{self} Error closing Speechmatics client: {e}")
         finally:
             self._client = None
+            await self._call_event_handler("on_disconnected")
 
     def _process_config(self) -> None:
         """Create a formatted STT transcription config.
@@ -749,14 +750,13 @@ class SpeechmaticsSTTService(STTService):
             return
 
         # Frames to send
-        upstream_frames: list[Frame] = []
         downstream_frames: list[Frame] = []
 
         # If VAD is enabled, then send a speaking frame
         if self._params.enable_vad and not self._is_speaking:
             logger.debug("User started speaking")
             self._is_speaking = True
-            upstream_frames += [BotInterruptionFrame()]
+            await self.push_interruption_task_frame_and_wait()
             downstream_frames += [UserStartedSpeakingFrame()]
 
         # If final, then re-parse into TranscriptionFrame
@@ -793,10 +793,6 @@ class SpeechmaticsSTTService(STTService):
             logger.debug("User stopped speaking")
             self._is_speaking = False
             downstream_frames += [UserStoppedSpeakingFrame()]
-
-        # Send UPSTREAM frames
-        for frame in upstream_frames:
-            await self.push_frame(frame, FrameDirection.UPSTREAM)
 
         # Send the DOWNSTREAM frames
         for frame in downstream_frames:
