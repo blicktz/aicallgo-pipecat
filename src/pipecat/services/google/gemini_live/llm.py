@@ -375,6 +375,26 @@ class GeminiLiveAssistantContextAggregator(OpenAIAssistantContextAggregator):
         # when the API evolves.
         pass
 
+    async def handle_function_call_result(self, frame: "FunctionCallResultFrame"):
+        """Handle function call result - ENHANCED DEBUG VERSION.
+
+        Args:
+            frame: The function call result frame to handle.
+        """
+        logger.debug("🔍 GEMINI AGGREGATOR: handle_function_call_result called")
+        logger.debug(f"    tool_call_id: {frame.tool_call_id}")
+        logger.debug(f"    function_name: {frame.function_name}")
+        logger.debug(f"    result: {frame.result}")
+        logger.debug(f"    context messages BEFORE: {json.dumps(self._context.messages, indent=2)}")
+
+        # Call parent implementation
+        await super().handle_function_call_result(frame)
+
+        logger.debug(f"    context messages AFTER: {json.dumps(self._context.messages, indent=2)}")
+        logger.debug(
+            f"    last message role: {self._context.messages[-1].get('role') if self._context.messages else 'NO MESSAGES'}"
+        )
+
 
 @dataclass
 class GeminiLiveContextAggregatorPair:
@@ -617,6 +637,9 @@ class GeminiLiveLLMService(LLMService):
         self._bot_text_buffer = ""
         self._llm_output_buffer = ""
 
+        # Tool result tracking for race condition handling
+        self._sent_tool_results: set[str] = set()
+
         self._sample_rate = 24000
 
         self._language = params.language
@@ -831,18 +854,47 @@ class GeminiLiveLLMService(LLMService):
             await self.push_frame(frame, direction)
         elif isinstance(frame, OpenAILLMContextFrame):
             context: GeminiLiveContext = GeminiLiveContext.upgrade(frame.context)
+
+            # ENHANCED DEBUG LOGGING
+            logger.debug("🔍 GEMINI LLM: Received OpenAILLMContextFrame")
+            logger.debug(f"    Total messages in context: {len(context.messages)}")
+            if context.messages:
+                logger.debug(f"    Last message: {context.messages[-1]}")
+                logger.debug(f"    Last message role: {context.messages[-1].get('role')}")
+
             # For now, we'll only trigger inference here when either:
             #   1. We have not seen a context frame before
-            #   2. The last message is a tool call result
+            #   2. There are any unsent tool results
             if not self._context:
+                logger.debug("🔍 GEMINI LLM: First context frame, creating initial response")
                 self._context = context
                 if frame.context.tools:
                     self._tools = frame.context.tools
                 await self._create_initial_response()
-            elif context.messages and context.messages[-1].get("role") == "tool":
-                # Support just one tool call per context frame for now
-                tool_result_message = context.messages[-1]
-                await self._tool_result(tool_result_message)
+            else:
+                # Scan for any unsent tool results (not just the last message)
+                # This handles race conditions where user messages arrive after tool results
+                pending_tool_results = []
+
+                for message in context.messages:
+                    if message.get("role") == "tool":
+                        tool_call_id = message.get("tool_call_id")
+
+                        # Check if this tool result has already been sent
+                        if tool_call_id and tool_call_id not in self._sent_tool_results:
+                            # Skip "IN_PROGRESS" placeholder messages
+                            content = message.get("content", "")
+                            if content != "IN_PROGRESS":
+                                pending_tool_results.append(message)
+                                logger.debug(f"🔍 GEMINI LLM: Found pending tool result: {tool_call_id}")
+
+                # Send all pending tool results
+                if pending_tool_results:
+                    logger.debug(f"🔍 GEMINI LLM: Sending {len(pending_tool_results)} pending tool result(s)")
+                    for tool_result_message in pending_tool_results:
+                        await self._tool_result(tool_result_message)
+                else:
+                    logger.debug("🔍 GEMINI LLM: No pending tool results found")
         elif isinstance(frame, LLMContextFrame):
             raise NotImplementedError("Universal LLMContext is not yet supported for Gemini Live.")
         elif isinstance(frame, InputTextRawFrame):
@@ -899,6 +951,10 @@ class GeminiLiveLLMService(LLMService):
             # Here we assume that if we have a client, we are connected. We
             # handle disconnections in the send/recv code paths.
             return
+
+        # Clear tool result tracking on new connection
+        self._sent_tool_results.clear()
+        logger.debug("🔍 GEMINI LLM: Cleared tool result tracking for new connection")
 
         if session_resumption_handle:
             logger.info(
@@ -1110,6 +1166,11 @@ class GeminiLiveLLMService(LLMService):
         try:
             self._disconnecting = True
             await self.stop_all_metrics()
+
+            # Clear tool result tracking
+            self._sent_tool_results.clear()
+            logger.debug("🔍 GEMINI LLM: Cleared tool result tracking on disconnect")
+
             if self._connection_task:
                 await self.cancel_task(self._connection_task, timeout=1.0)
                 self._connection_task = None
@@ -1242,6 +1303,9 @@ class GeminiLiveLLMService(LLMService):
     async def _tool_result(self, tool_result_message):
         """Send tool result back to the API."""
         if self._disconnecting or not self._session:
+            logger.warning(
+                f"🔍 GEMINI LLM: Cannot send tool result - disconnecting={self._disconnecting}, session={self._session is not None}"
+            )
             return
 
         # For now we're shoving the name into the tool_call_id field, so this
@@ -1249,11 +1313,24 @@ class GeminiLiveLLMService(LLMService):
         id = tool_result_message.get("tool_call_id")
         name = tool_result_message.get("tool_call_name")
         result = json.loads(tool_result_message.get("content") or "")
+
+        logger.debug("🔍 GEMINI LLM: Sending tool result to Gemini Live")
+        logger.debug(f"    id: {id}")
+        logger.debug(f"    name: {name}")
+        logger.debug(f"    result: {result}")
+
         response = FunctionResponse(name=name, id=id, response=result)
 
         try:
             await self._session.send_tool_response(function_responses=response)
+
+            # Mark this tool result as sent
+            self._sent_tool_results.add(id)
+
+            logger.debug("🔍 GEMINI LLM: Tool result sent successfully! ✅")
+            logger.debug(f"    Tracked sent tool results: {len(self._sent_tool_results)} total")
         except Exception as e:
+            logger.error(f"🔍 GEMINI LLM: Failed to send tool result! ❌ Error: {e}")
             await self._handle_send_error(e)
 
     @traced_gemini_live(operation="llm_setup")
