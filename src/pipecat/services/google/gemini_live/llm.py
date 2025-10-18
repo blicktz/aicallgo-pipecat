@@ -641,6 +641,13 @@ class GeminiLiveLLMService(LLMService):
         self._consecutive_failures = 0
         self._connection_start_time = None
 
+        # Audio stream monitoring (for detecting speech end and flushing buffer)
+        # Track when transcriptions arrive, not audio frames (frames are continuous)
+        self._last_transcription_time = 0.0
+        self._bot_finished_at = 0.0  # Track when bot finishes to detect post-bot silence
+        self._audio_stream_ended = False
+        self._stream_monitor_task = None
+
         self._settings = {
             "frequency_penalty": params.frequency_penalty,
             "max_tokens": params.max_tokens,
@@ -830,13 +837,7 @@ class GeminiLiveLLMService(LLMService):
             frame: The frame to process.
             direction: The frame processing direction.
         """
-        # Defer EndFrame handling until after the bot turn is finished
-        if isinstance(frame, EndFrame):
-            if self._bot_is_speaking:
-                logger.debug("Deferring handling EndFrame until bot turn is finished")
-                self._end_frame_pending_bot_turn_finished = frame
-                return
-
+        # Process all frames immediately (no EndFrame deferral)
         await super().process_frame(frame, direction)
 
         if isinstance(frame, TranscriptionFrame):
@@ -919,9 +920,14 @@ class GeminiLiveLLMService(LLMService):
 
         self._bot_is_speaking = speaking
 
-        if not self._bot_is_speaking and self._end_frame_pending_bot_turn_finished:
-            await self.queue_frame(self._end_frame_pending_bot_turn_finished)
-            self._end_frame_pending_bot_turn_finished = None
+        # Reset flush flag on any speaking state change to allow monitoring
+        self._audio_stream_ended = False
+
+        # Track when bot ACTUALLY stops speaking (for post-bot silence monitoring)
+        # This is more accurate than turn_complete, which fires when Gemini finishes
+        # generating the response (before audio finishes playing)
+        if not speaking:
+            self._bot_finished_at = time.time()
 
     async def _connect(self, session_resumption_handle: Optional[str] = None):
         """Establish client connection to Gemini Live API."""
@@ -1147,6 +1153,11 @@ class GeminiLiveLLMService(LLMService):
             # Clear tool result tracking
             self._sent_tool_results.clear()
 
+            # Stop audio stream monitor
+            if self._stream_monitor_task:
+                await self.cancel_task(self._stream_monitor_task)
+                self._stream_monitor_task = None
+
             if self._connection_task:
                 await self.cancel_task(self._connection_task, timeout=1.0)
                 self._connection_task = None
@@ -1179,6 +1190,44 @@ class GeminiLiveLLMService(LLMService):
             self._user_audio_buffer.extend(audio)
             length = int((frame.sample_rate * frame.num_channels * 2) * 0.5)
             self._user_audio_buffer = self._user_audio_buffer[-length:]
+
+    async def _audio_stream_monitor(self):
+        """Monitor for post-bot silence and flush when needed.
+
+        Per Gemini Live API documentation:
+        'When the audio stream pauses for more than a second, you should send
+        an audioStreamEnd event to flush cached audio.'
+
+        This monitors after the bot finishes speaking. If no user transcription
+        arrives within 1.5 seconds, we flush to wake up Gemini's VAD.
+        """
+        import asyncio
+
+        while not self._disconnecting:
+            await asyncio.sleep(0.1)  # Check every 100ms
+
+            if not self._session or self._audio_stream_ended:
+                continue
+
+            # Flush 1.5s after bot finishes IF no transcription received yet
+            # This handles delayed VAD detection after bot stops speaking
+            silence_since_bot_finished = time.time() - self._bot_finished_at
+            if (
+                silence_since_bot_finished > 1.5
+                and self._bot_finished_at > 0
+                and self._bot_finished_at > self._last_transcription_time
+            ):
+                logger.info(
+                    f"⏸️ Bot finished {silence_since_bot_finished:.1f}s ago, no user response detected, flushing Gemini buffer"
+                )
+                try:
+                    # Send audioStreamEnd to flush Gemini's server-side buffer
+                    await self._session.send_realtime_input(audio_stream_end=True)
+                    self._audio_stream_ended = True
+                    # Reset to avoid repeated flushes for same bot turn
+                    self._bot_finished_at = 0.0
+                except Exception as e:
+                    logger.error(f"❌ Error sending audioStreamEnd: {e}", exc_info=True)
 
     async def _send_user_text(self, text: str):
         """Send user text via Gemini Live API's realtime input stream.
@@ -1305,6 +1354,11 @@ class GeminiLiveLLMService(LLMService):
     async def _handle_session_ready(self, session: AsyncSession):
         """Handle the session being ready."""
         self._session = session
+
+        # Start audio stream monitor task
+        self._stream_monitor_task = self.create_task(self._audio_stream_monitor())
+        logger.info("✅ Started audio stream monitor task")
+
         # If we were just waititng for the session to be ready to run the LLM,
         # do that now.
         if self._run_llm_when_session_ready:
@@ -1447,6 +1501,10 @@ class GeminiLiveLLMService(LLMService):
 
         if not text:
             return
+
+        # Track transcription arrival time for silence detection
+        self._last_transcription_time = time.time()
+        self._audio_stream_ended = False  # Reset flush flag when speech detected
 
         # Strip leading space from sentence starts if buffer is empty
         if text.startswith(" ") and not self._user_transcription_buffer:
