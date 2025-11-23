@@ -806,9 +806,19 @@ class GeminiLiveLLMService(LLMService):
     #
 
     async def _handle_interruption(self):
+        """Handle interruption by stopping audio and clearing buffers."""
+        # Clear audio buffers to prevent stale audio from playing
+        self._bot_audio_buffer = bytearray()
+        self._bot_text_buffer = ""
+
+        # Set bot speaking state to False
         await self._set_bot_is_speaking(False)
+
+        # Push stop frames
         await self.push_frame(TTSStoppedFrame())
         await self.push_frame(LLMFullResponseEndFrame())
+
+        logger.info("Interruption handled: buffers cleared, bot stopped speaking")
 
     async def _handle_user_started_speaking(self, frame):
         self._user_is_speaking = True
@@ -1080,6 +1090,8 @@ class GeminiLiveLLMService(LLMService):
                             await self._handle_msg_output_transcription(message)
                         elif message.server_content and message.server_content.grounding_metadata:
                             await self._handle_msg_grounding_metadata(message)
+                        elif message.server_content and message.server_content.interrupted:
+                            await self._handle_msg_interrupted(message)
                         elif message.tool_call:
                             await self._handle_msg_tool_call(message)
                         elif message.session_resumption_update:
@@ -1570,6 +1582,28 @@ class GeminiLiveLLMService(LLMService):
             grounding_metadata = message.server_content.grounding_metadata
             # Process the grounding metadata immediately
             await self._process_grounding_metadata(grounding_metadata, self._search_result_buffer)
+
+    async def _handle_msg_interrupted(self, message: LiveServerMessage):
+        """Handle interruption signal from Gemini Live API.
+
+        Per Gemini Live API documentation, when server_content.interrupted is True,
+        the application should immediately stop playing audio as the user has
+        interrupted the model's ongoing generation.
+
+        Args:
+            message: The server message containing the interruption flag.
+        """
+        logger.info(
+            "🛑 Interruption detected from Gemini Live API - stopping audio playback",
+            extra_fields={"timestamp": time.time()}
+        )
+
+        # Call the existing interruption handler
+        await self._handle_interruption()
+
+        # Push InterruptionFrame to stop audio output immediately
+        # This will trigger the transport's interrupt handling
+        await self.push_frame(InterruptionFrame())
 
     async def _process_grounding_metadata(
         self, grounding_metadata: GroundingMetadata, search_result: str = ""
