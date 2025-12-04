@@ -1194,6 +1194,21 @@ class GeminiLiveLLMService(LLMService):
         except Exception as e:
             logger.error(f"{self} error disconnecting: {e}")
 
+    async def stop_silence_recovery_monitor(self):
+        """Stop only the silence recovery monitor without disconnecting the LLM service.
+
+        This is useful when the call is being transferred and we want to keep the pipeline
+        connected (so caller stays in conference) but stop the silence recovery system
+        from triggering recovery prompts.
+        """
+        if self._silence_monitor_task:
+            try:
+                await self.cancel_task(self._silence_monitor_task)
+                self._silence_monitor_task = None
+                logger.info("Silence recovery monitor stopped (call transfer/conference)")
+            except Exception as e:
+                logger.error(f"Error stopping silence recovery monitor: {e}")
+
     async def _send_user_audio(self, frame):
         """Send user audio frame to Gemini Live API."""
         if self._audio_input_paused or self._disconnecting or not self._session:
