@@ -623,6 +623,7 @@ class GeminiLiveLLMService(LLMService):
         self._bot_is_speaking = False
         self._user_audio_buffer = bytearray()
         self._user_transcription_buffer = ""
+        self._user_speech_signaled = False  # Track if we've signaled user started speaking this turn
         self._last_transcription_sent = ""
         self._bot_audio_buffer = bytearray()
         self._bot_text_buffer = ""
@@ -1441,6 +1442,9 @@ class GeminiLiveLLMService(LLMService):
         if not self._silence_recovery.is_monitoring_active():
             self._silence_recovery.start_monitoring()
 
+        # Reset user speech signal flag when bot starts its turn
+        self._user_speech_signaled = False
+
         part = msg.server_content.model_turn.parts[0]
         if not part:
             return
@@ -1591,6 +1595,20 @@ class GeminiLiveLLMService(LLMService):
 
         # Accumulate text in the buffer
         self._user_transcription_buffer += text
+
+        # Log partial transcription for debugging
+        if text.strip():
+            logger.debug(
+                f"[Transcription:user:partial] Received: [{text.strip()}] "
+                f"(buffer total: {len(self._user_transcription_buffer)} chars)"
+            )
+
+        # Signal user started speaking on FIRST transcription after bot spoke
+        if not self._user_speech_signaled and text.strip():
+            logger.debug("🎤 First transcription detected - signaling user started speaking")
+            self._user_speech_signaled = True
+            # Directly call the user started speaking handler with emulated frame
+            await self._handle_user_started_speaking(UserStartedSpeakingFrame(emulated=True))
 
         # Check for complete sentences
         while True:
