@@ -1442,6 +1442,9 @@ class GeminiLiveLLMService(LLMService):
         if not self._silence_recovery.is_monitoring_active():
             self._silence_recovery.start_monitoring()
 
+        # Stop recovery timer when bot starts speaking
+        self._silence_recovery.on_bot_started_speaking()
+
         # Reset user speech signal flag when bot starts its turn
         self._user_speech_signaled = False
 

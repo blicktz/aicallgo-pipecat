@@ -22,6 +22,8 @@ class SilenceRecoveryState:
     recovery_attempt_count: int = 0
     user_spoke_since_last_recovery: bool = False
     monitoring_started: bool = False  # Track if monitoring has begun
+    recovery_timer_active: bool = False  # Track if recovery timer is running
+    recovery_timer_start_time: float = 0.0  # When the timer was started
 
     def reset(self):
         """Reset recovery attempts when conversation becomes active."""
@@ -32,9 +34,14 @@ class SilenceRecoveryState:
 class SilenceRecoverySystem:
     """Manages silence detection and recovery prompts with exponential backoff.
 
-    Recovery is triggered only when BOTH model and user are silent for threshold time.
-    Uses exponential backoff (10s, 20s, 40s...) but only when user hasn't spoken since last attempt.
-    If user speaks, entire system resets to initial state.
+    Recovery timer starts when bot finishes speaking and stops when bot starts speaking again.
+    Recovery is triggered when user has been silent for threshold time while timer is active.
+    Uses exponential backoff (10s, 20s, 40s...) but resets when user speaks.
+
+    Timer lifecycle:
+    - STARTS: When bot finishes speaking
+    - STOPS: When bot starts speaking OR when user starts speaking
+    - RESETS: When user speaks (count returns to 0, timer resets to 10s)
 
     Monitoring begins after the bot's first response to avoid false triggers
     during initial greeting generation.
@@ -77,25 +84,57 @@ class SilenceRecoverySystem:
         # Store previous count for logging
         previous_count = self._state.recovery_attempt_count
 
+        # Stop recovery timer
+        self._state.recovery_timer_active = False
+        self._state.recovery_timer_start_time = 0.0
+
         # Full reset: conversation is active
         self._state.reset()
 
         if self._state.monitoring_started:
             self._logger.debug(
-                "👤 User started speaking - Recovery system reset",
+                "👤 User started speaking - Recovery system reset, timer stopped",
                 extra_fields={
                     "action": "user_speech_reset",
                     "previous_attempt_count": previous_count,
                 },
             )
 
-    def on_bot_response(self) -> None:
-        """Called when bot generates a response.
+    def on_bot_started_speaking(self) -> None:
+        """Called when bot starts speaking - stops the recovery timer.
 
-        Updates last response time but doesn't reset counter
-        (bot might be responding to recovery prompt).
+        The recovery timer should only run during silence periods, not while
+        the bot is actively speaking.
         """
-        self._state.last_bot_response_time = time.time()
+        if self._state.recovery_timer_active:
+            self._state.recovery_timer_active = False
+            if self._state.monitoring_started:
+                self._logger.debug(
+                    "🤖 Bot started speaking - Recovery timer stopped",
+                    extra_fields={"action": "bot_speaking_timer_stop"},
+                )
+
+    def on_bot_response(self) -> None:
+        """Called when bot finishes speaking - starts the recovery timer.
+
+        The timer starts after bot completes its response to measure
+        user silence period. Updates last response time for logging.
+        """
+        now = time.time()
+        self._state.last_bot_response_time = now
+
+        # Start recovery timer when bot finishes speaking
+        self._state.recovery_timer_active = True
+        self._state.recovery_timer_start_time = now
+
+        if self._state.monitoring_started:
+            self._logger.debug(
+                "🤖 Bot finished speaking - Recovery timer started",
+                extra_fields={
+                    "action": "bot_finished_timer_start",
+                    "current_threshold": self._get_current_threshold(),
+                },
+            )
 
         # Don't reset counter here - bot might be responding to recovery prompt
         # Counter only resets when user speaks
@@ -105,40 +144,29 @@ class SilenceRecoverySystem:
 
         Returns True only when:
         1. Monitoring has been started (after first bot response)
-        2. Both bot and user have been silent for threshold time
-        3. Threshold calculated with exponential backoff
-        4. If user spoke since last recovery, use base threshold (reset backoff)
+        2. Recovery timer is active (bot has finished speaking)
+        3. User has been silent for threshold time
+        4. Threshold calculated with exponential backoff
         """
         # Don't trigger before monitoring starts
         if not self._state.monitoring_started:
             return False
 
+        # Don't trigger if timer is not active (bot is speaking)
+        if not self._state.recovery_timer_active:
+            return False
+
         now = time.time()
 
-        # Calculate silence durations
-        bot_silence = (
-            now - self._state.last_bot_response_time
-            if self._state.last_bot_response_time > 0
-            else 0
-        )
-        user_silence = (
-            now - self._state.last_user_speech_time
-            if self._state.last_user_speech_time > 0
-            else 999
-        )
+        # Calculate user silence duration from when timer started
+        # This ensures we only track silence AFTER bot stopped speaking
+        user_silence_since_timer_start = now - self._state.recovery_timer_start_time
 
-        # Get current threshold
+        # Get current threshold with exponential backoff
         threshold = self._get_current_threshold()
 
-        # If user hasn't spoken yet (beginning of call), only check bot silence
-        user_silent = (
-            user_silence > threshold if self._state.last_user_speech_time > 0 else True
-        )
-
-        # Check if bot exceeded threshold AND user is silent
-        bot_silent = bot_silence > threshold
-
-        return bot_silent and user_silent
+        # Trigger if user has been silent long enough
+        return user_silence_since_timer_start > threshold
 
     def _get_current_threshold(self) -> float:
         """Calculate current threshold with exponential backoff.
@@ -161,18 +189,15 @@ class SilenceRecoverySystem:
         """
         now = time.time()
         threshold = self._get_current_threshold()
-        bot_silence = int(now - self._state.last_bot_response_time)
-        user_silence = (
-            int(now - self._state.last_user_speech_time)
-            if self._state.last_user_speech_time > 0
-            else 0
-        )
+
+        # Calculate user silence since timer started (after bot finished speaking)
+        user_silence_duration = int(now - self._state.recovery_timer_start_time)
 
         # Prepare recovery prompt
         prompt = (
-            f"You've been silent for more than {bot_silence} seconds, "
-            f"and you might have missed the caller's speech during this time. "
-            f"So politely ask the caller: 'Sorry, I might have missed what you said. Can you say it again?'"
+            f"The caller has been silent for {user_silence_duration} seconds "
+            f"after you finished speaking. You might have missed their speech. "
+            f"Please politely ask: 'Sorry, I might have missed what you said. Can you say it again?'"
         )
 
         # Update state
@@ -190,8 +215,7 @@ class SilenceRecoverySystem:
 
         # Prepare logging context
         log_context = {
-            "bot_silence_sec": bot_silence,
-            "user_silence_sec": user_silence,
+            "user_silence_sec": user_silence_duration,
             "threshold_sec": threshold,
             "recovery_attempt": self._state.recovery_attempt_count,
             "next_threshold_sec": self._get_current_threshold(),
@@ -200,7 +224,7 @@ class SilenceRecoverySystem:
 
         self._logger.warning(
             f"🔴 SILENCE DETECTED (Attempt #{self._state.recovery_attempt_count}): "
-            f"Bot silent {bot_silence}s, User silent {user_silence}s (threshold: {threshold}s)",
+            f"User silent {user_silence_duration}s after bot finished (threshold: {threshold}s)",
             extra_fields=log_context,
         )
 
@@ -211,10 +235,11 @@ class SilenceRecoverySystem:
         now = time.time()
         return {
             "monitoring_active": self._state.monitoring_started,
-            "bot_silence_sec": now - self._state.last_bot_response_time
-            if self._state.last_bot_response_time > 0
+            "timer_active": self._state.recovery_timer_active,
+            "user_silence_since_timer_start_sec": now - self._state.recovery_timer_start_time
+            if self._state.recovery_timer_active and self._state.recovery_timer_start_time > 0
             else 0,
-            "user_silence_sec": now - self._state.last_user_speech_time
+            "user_silence_since_last_speech_sec": now - self._state.last_user_speech_time
             if self._state.last_user_speech_time > 0
             else 0,
             "current_threshold_sec": self._get_current_threshold(),
