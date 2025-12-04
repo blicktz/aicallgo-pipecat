@@ -78,6 +78,7 @@ from pipecat.utils.time import time_now_iso8601
 from pipecat.utils.tracing.service_decorators import traced_gemini_live, traced_stt
 
 from .file_api import GeminiFileAPI
+from .silence_recovery import SilenceRecoverySystem
 
 try:
     from google.genai import Client
@@ -649,8 +650,8 @@ class GeminiLiveLLMService(LLMService):
         self._audio_stream_ended = False
         self._stream_monitor_task = None
 
-        # Silence recovery monitoring (for sending text prompt when bot hangs)
-        self._last_model_response_time = 0.0
+        # Silence recovery system (encapsulated in dedicated class)
+        self._silence_recovery = SilenceRecoverySystem(initial_threshold_sec=10.0)
         self._silence_monitor_task = None
 
         self._settings = {
@@ -827,7 +828,9 @@ class GeminiLiveLLMService(LLMService):
 
     async def _handle_user_started_speaking(self, frame):
         self._user_is_speaking = True
-        pass
+
+        # Reset silence recovery when user speaks (conversation is active)
+        self._silence_recovery.on_user_started_speaking()
 
     async def _handle_user_stopped_speaking(self, frame):
         self._user_is_speaking = False
@@ -1274,18 +1277,17 @@ class GeminiLiveLLMService(LLMService):
             await self._handle_send_error(e)
 
     async def _silence_recovery_monitor(self):
-        """Monitor for prolonged bot silence and send text prompt to trigger response.
+        """Monitor silence and trigger recovery prompts via SilenceRecoverySystem.
 
-        When the bot has been silent for 5+ seconds after receiving transcriptions,
-        sends a text prompt to Gemini explaining the situation and instructing it
-        to ask the caller to repeat their message.
+        This monitor runs continuously but only triggers recovery after the bot's
+        first response to avoid false positives during initial greeting generation.
 
-        This addresses cases where:
-        - Short utterances ("yes", "ok") don't trigger responses
-        - Low volume speech is not processed
-        - Gemini's VAD gets stuck and stops responding
+        Recovery uses exponential backoff (10s, 20s, 40s...) but resets when
+        user actively speaks.
         """
-        logger.info("🔍 Silence recovery monitor started")
+        logger.info(
+            "🔍 Silence recovery monitor task started (waiting for bot's first response)"
+        )
 
         while not self._disconnecting:
             await asyncio.sleep(0.5)  # Check every 500ms
@@ -1293,55 +1295,25 @@ class GeminiLiveLLMService(LLMService):
             if not self._session:
                 continue
 
-            now = time.time()
-
-            # Calculate how long bot has been silent
-            bot_silence = now - self._last_model_response_time if self._last_model_response_time > 0 else 0
-
-            # Trigger recovery after 5+ seconds of bot silence
-            if bot_silence > 5.0:
-                silence_sec = int(bot_silence)
-
-                logger.warning(
-                    f"🔴 SILENCE DETECTED: Bot silent for {silence_sec}s - Sending recovery prompt to Gemini",
-                    extra_fields={
-                        "bot_silence_sec": bot_silence,
-                        "action": "silence_recovery_triggered"
-                    }
-                )
-
+            # Check if recovery should trigger (encapsulated in recovery system)
+            if self._silence_recovery.should_trigger_recovery():
                 try:
-                    # Craft context-aware prompt for Gemini
-                    prompt = (
-                        f"You've been silent for more than {silence_sec} seconds, "
-                        f"and you might have missed the caller's speech during this time. "
-                        f"So politely ask the caller: 'Sorry, I might have missed what you said. Can you say it again?'"
-                    )
+                    # Get recovery prompt and context from recovery system
+                    prompt, log_context = self._silence_recovery.trigger_recovery()
 
-                    # Send text prompt via realtime_input
-                    # This works even with modalities="AUDIO" - it only affects output format
+                    # Send prompt to Gemini
                     await self._session.send_realtime_input(text=prompt)
 
                     logger.info(
-                        "✅ Recovery prompt sent to Gemini successfully",
-                        extra_fields={
-                            "prompt_length": len(prompt),
-                            "silence_duration": silence_sec,
-                            "action": "recovery_prompt_sent"
-                        }
+                        f"✅ Recovery prompt sent (Attempt #{log_context['recovery_attempt']})",
+                        extra_fields=log_context,
                     )
-
-                    # Reset timer to avoid repeated prompts (wait at least 10s before retry)
-                    self._last_model_response_time = now + 10
 
                 except Exception as e:
                     logger.error(
                         f"❌ Failed to send recovery prompt: {str(e)}",
-                        extra_fields={
-                            "error_type": type(e).__name__,
-                            "action": "recovery_prompt_failed"
-                        },
-                        exc_info=True
+                        extra_fields={"error_type": type(e).__name__},
+                        exc_info=True,
                     )
 
     async def _send_user_video(self, frame):
@@ -1464,8 +1436,12 @@ class GeminiLiveLLMService(LLMService):
 
     async def _handle_msg_model_turn(self, msg: LiveServerMessage):
         """Handle the model turn message."""
-        # Track when bot responds (for silence recovery monitoring)
-        self._last_model_response_time = time.time()
+        # Track bot response for silence recovery
+        self._silence_recovery.on_bot_response()
+
+        # Start monitoring after first bot response (prevents false trigger during greeting)
+        if not self._silence_recovery.is_monitoring_active():
+            self._silence_recovery.start_monitoring()
 
         part = msg.server_content.model_turn.parts[0]
         if not part:
