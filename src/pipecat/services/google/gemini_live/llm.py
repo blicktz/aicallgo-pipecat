@@ -1436,10 +1436,8 @@ class GeminiLiveLLMService(LLMService):
 
     async def _handle_msg_model_turn(self, msg: LiveServerMessage):
         """Handle the model turn message."""
-        # Track bot response for silence recovery
-        self._silence_recovery.on_bot_response()
-
         # Start monitoring after first bot response (prevents false trigger during greeting)
+        # Note: Timer is updated in _handle_msg_turn_complete when bot FINISHES speaking
         if not self._silence_recovery.is_monitoring_active():
             self._silence_recovery.start_monitoring()
 
@@ -1530,6 +1528,11 @@ class GeminiLiveLLMService(LLMService):
     async def _handle_msg_turn_complete(self, message: LiveServerMessage):
         """Handle the turn complete message."""
         await self._set_bot_is_speaking(False)
+
+        # Update recovery timer when bot FINISHES speaking (not when it starts)
+        # This ensures we measure silence AFTER bot completes its response
+        self._silence_recovery.on_bot_response()
+
         text = self._bot_text_buffer
 
         # Trace the complete LLM response (this will be handled by the decorator)
