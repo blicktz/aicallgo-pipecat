@@ -11,6 +11,7 @@ Gemini Live API, supporting both text and audio modalities with
 voice transcription, streaming responses, and tool usage.
 """
 
+import asyncio
 import base64
 import io
 import json
@@ -648,6 +649,10 @@ class GeminiLiveLLMService(LLMService):
         self._audio_stream_ended = False
         self._stream_monitor_task = None
 
+        # Silence recovery monitoring (for sending text prompt when bot hangs)
+        self._last_model_response_time = 0.0
+        self._silence_monitor_task = None
+
         self._settings = {
             "frequency_penalty": params.frequency_penalty,
             "max_tokens": params.max_tokens,
@@ -1170,6 +1175,11 @@ class GeminiLiveLLMService(LLMService):
                 await self.cancel_task(self._stream_monitor_task)
                 self._stream_monitor_task = None
 
+            # Stop silence recovery monitor
+            if self._silence_monitor_task:
+                await self.cancel_task(self._silence_monitor_task)
+                self._silence_monitor_task = None
+
             if self._connection_task:
                 await self.cancel_task(self._connection_task, timeout=1.0)
                 self._connection_task = None
@@ -1262,6 +1272,77 @@ class GeminiLiveLLMService(LLMService):
             await self._session.send_realtime_input(text=text)
         except Exception as e:
             await self._handle_send_error(e)
+
+    async def _silence_recovery_monitor(self):
+        """Monitor for prolonged bot silence and send text prompt to trigger response.
+
+        When the bot has been silent for 5+ seconds after receiving transcriptions,
+        sends a text prompt to Gemini explaining the situation and instructing it
+        to ask the caller to repeat their message.
+
+        This addresses cases where:
+        - Short utterances ("yes", "ok") don't trigger responses
+        - Low volume speech is not processed
+        - Gemini's VAD gets stuck and stops responding
+        """
+        logger.info("🔍 Silence recovery monitor started")
+
+        while not self._disconnecting:
+            await asyncio.sleep(0.5)  # Check every 500ms
+
+            if not self._session:
+                continue
+
+            now = time.time()
+
+            # Calculate how long bot has been silent
+            bot_silence = now - self._last_model_response_time if self._last_model_response_time > 0 else 0
+
+            # Trigger recovery after 5+ seconds of bot silence
+            if bot_silence > 5.0:
+                silence_sec = int(bot_silence)
+
+                logger.warning(
+                    f"🔴 SILENCE DETECTED: Bot silent for {silence_sec}s - Sending recovery prompt to Gemini",
+                    extra_fields={
+                        "bot_silence_sec": bot_silence,
+                        "action": "silence_recovery_triggered"
+                    }
+                )
+
+                try:
+                    # Craft context-aware prompt for Gemini
+                    prompt = (
+                        f"You've been silent for more than {silence_sec} seconds, "
+                        f"and you might have missed the caller's speech during this time. "
+                        f"So politely ask the caller: 'Sorry, I might have missed what you said. Can you say it again?'"
+                    )
+
+                    # Send text prompt via realtime_input
+                    # This works even with modalities="AUDIO" - it only affects output format
+                    await self._session.send_realtime_input(text=prompt)
+
+                    logger.info(
+                        "✅ Recovery prompt sent to Gemini successfully",
+                        extra_fields={
+                            "prompt_length": len(prompt),
+                            "silence_duration": silence_sec,
+                            "action": "recovery_prompt_sent"
+                        }
+                    )
+
+                    # Reset timer to avoid repeated prompts (wait at least 10s before retry)
+                    self._last_model_response_time = now + 10
+
+                except Exception as e:
+                    logger.error(
+                        f"❌ Failed to send recovery prompt: {str(e)}",
+                        extra_fields={
+                            "error_type": type(e).__name__,
+                            "action": "recovery_prompt_failed"
+                        },
+                        exc_info=True
+                    )
 
     async def _send_user_video(self, frame):
         """Send user video frame to Gemini Live API."""
@@ -1371,6 +1452,10 @@ class GeminiLiveLLMService(LLMService):
         self._stream_monitor_task = self.create_task(self._audio_stream_monitor())
         logger.info("✅ Started audio stream monitor task")
 
+        # Start silence recovery monitor task
+        self._silence_monitor_task = self.create_task(self._silence_recovery_monitor())
+        logger.info("✅ Started silence recovery monitor task")
+
         # If we were just waititng for the session to be ready to run the LLM,
         # do that now.
         if self._run_llm_when_session_ready:
@@ -1379,6 +1464,9 @@ class GeminiLiveLLMService(LLMService):
 
     async def _handle_msg_model_turn(self, msg: LiveServerMessage):
         """Handle the model turn message."""
+        # Track when bot responds (for silence recovery monitoring)
+        self._last_model_response_time = time.time()
+
         part = msg.server_content.model_turn.parts[0]
         if not part:
             return
